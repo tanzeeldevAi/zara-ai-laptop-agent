@@ -1,3 +1,3 @@
-"""LapPilot - remote laptop agent driven from Discord."""
+"""CodeHubb Assistant - remote laptop agent driven from your phone."""
 
 __version__ = "1.0.0"

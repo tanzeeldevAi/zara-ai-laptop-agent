@@ -45,6 +45,12 @@ def classify(tool_name: str, args: dict):
             "registry_set": "edits the Windows registry",
         }[tool_name]
 
+    if tool_name == "forget_fact":
+        return True, "permanently deletes a stored memory"
+
+    if tool_name in ("browser_click", "browser_type"):
+        return True, "interacts with a web page (clicks / types)"
+
     if tool_name == "power_action":
         action = str(args.get("action", "")).lower()
         if action in ("shutdown", "restart", "logoff", "hibernate"):

@@ -1,13 +1,18 @@
-"""Subscription brain: runs Zara on your Claude Code login instead of a paid API key.
+"""Subscription brain: runs the assistant on your Claude Code login instead
+of a paid API key.
 
-Uses the official Claude Agent SDK, which authenticates through the Claude Code CLI you're already
-signed into. Same models as the API (Opus etc.) - no quality loss - but billed to your Claude
-subscription rather than per-token API credits.
+Uses the official Claude Agent SDK, which authenticates through the Claude Code
+CLI you're already signed into. Same models as the API (Opus etc.) - no quality
+loss - but billed to your Claude subscription rather than per-token API credits.
 
-Our laptop tools are exposed to the SDK as an in-process MCP server, so screenshots, shell,
-WhatsApp control and everything else work exactly the same. Screenshots are handed to the model as
-vision AND pushed to Discord, via a contextvar that carries the active channel into each tool call
-(verified to propagate correctly).
+Our laptop tools are exposed to the SDK as an in-process MCP server.
+Phase 0 change: the MCP wrappers no longer call handlers directly — every call
+goes through the shared ToolExecutor, so the safety pipeline (classify ->
+confirmation -> audit) applies to this brain exactly as it does to the API
+brain. Previously this path never consulted security.classify at all, so
+CONFIRM_RISKY=true silently did nothing here. Screenshots are handed to the
+model as vision AND pushed to the channel (when the tool asks), via a
+contextvar that carries the active channel into each tool call.
 """
 
 import asyncio
@@ -18,11 +23,12 @@ from pathlib import Path
 
 import claude_agent_sdk as sdk
 
-from .brain import SYSTEM_PROMPT
-from .config import CONFIG
-from .tools import load_all
+from ..config import CONFIG
+from ..prompts import SYSTEM_PROMPT
+from ..safety import ToolExecutor
+from ..tools import load_all
 
-SCHEMAS, HANDLERS = load_all()
+SCHEMAS, _HANDLERS = load_all()
 
 # Where tool output (screenshots, files) gets sent.
 #
@@ -38,105 +44,76 @@ def _current_channel():
     return _ACTIVE if _ACTIVE is not None else _CHAN.get()
 
 
-def _clip(text, limit):
-    text = text or ""
-    return text if len(text) <= limit else text[:limit] + f"\n... [truncated, {len(text)} chars total]"
-
-
 def _encode(path):
     return base64.standard_b64encode(Path(path).read_bytes()).decode("ascii")
 
 
-def _build_tool(schema):
+def _build_tool(schema, executor):
     name = schema["name"]
-    handler = HANDLERS[name]
 
     @sdk.tool(name, schema["description"], schema["input_schema"])
-    async def _run(args, _handler=handler, _name=name):
+    async def _run(args, _executor=executor, _name=name):
         chan = _current_channel()
-        # Every Discord message costs a round trip and counts against rate limits. Announcing
-        # every click/wait/screenshot made long jobs crawl, so this is opt-in only.
-        if chan is not None and CONFIG.show_tool_calls:
-            try:
-                await chan.note(f"`{_name}`")
-            except Exception:  # noqa: BLE001
-                pass
+        outcome = await _executor.execute(_name, args or {}, chan, show_images_to_user=False)
 
-        try:
-            result = await asyncio.to_thread(_handler, **(args or {}))
-        except TypeError as exc:
-            return {"content": [{"type": "text", "text": f"Bad arguments for {_name}: {exc}"}], "isError": True}
-        except Exception as exc:  # noqa: BLE001
-            traceback.print_exc()
-            return {"content": [{"type": "text", "text": f"{_name} raised {type(exc).__name__}: {exc}"}], "isError": True}
-
-        content = [{"type": "text", "text": _clip(result.get("text") or "(no output)", CONFIG.max_tool_output)}]
-        captions = result.get("captions") or []
-        # Images always go to the model so it can see the screen. They only go to Discord
-        # when the tool says so - uploading every intermediate screenshot was the single
-        # biggest slowdown on long jobs.
-        show = bool(result.get("show"))
-
-        for index, image_path in enumerate(result.get("images") or []):
+        content = [{"type": "text", "text": outcome.text}]
+        # Images always go to the model so it can see the screen. The executor
+        # has already forwarded to the channel only what the tool asked to show.
+        for image_path in outcome.images:
             try:
                 content.append({"type": "image", "data": _encode(image_path), "mimeType": "image/jpeg"})
             except Exception as exc:  # noqa: BLE001
                 content.append({"type": "text", "text": f"(image attach failed: {exc})"})
-            if chan is not None and show:
-                await chan.send_file(image_path, captions[index] if index < len(captions) else None)
 
-        for index, file_path in enumerate(result.get("files") or []):
-            if chan is not None:
-                await chan.send_file(file_path, captions[index] if index < len(captions) else None)
-
-        if _name == "speak" and chan is not None:
-            chan.spoke = True  # tell main not to auto-speak a duplicate
-            try:
-                from .voice import SPOKE_CHANNELS
-
-                SPOKE_CHANNELS.add(chan.channel.id)
-            except Exception:  # noqa: BLE001
-                pass
-
-        return {"content": content}
+        result = {"content": content}
+        if outcome.is_error:
+            result["isError"] = True
+        return result
 
     return _run
 
 
-_TOOLS = [_build_tool(schema) for schema in SCHEMAS]
-_SERVER = sdk.create_sdk_mcp_server("laptop", "1.0.0", _TOOLS)
-_ALLOWED = [f"mcp__laptop__{schema['name']}" for schema in SCHEMAS]
-
-
-def _options():
-    kwargs = dict(
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"laptop": _SERVER},
-        allowed_tools=_ALLOWED,
-        permission_mode="bypassPermissions",
-        max_turns=CONFIG.max_iterations,
-        # keep Zara on our tools, not Claude Code's own file/bash tools
-        setting_sources=[],
-    )
-    if CONFIG.subscription_model:
-        kwargs["model"] = CONFIG.subscription_model
-    return sdk.ClaudeAgentOptions(**kwargs)
+def _make_server(executor):
+    tools = [_build_tool(schema, executor) for schema in SCHEMAS]
+    server = sdk.create_sdk_mcp_server("laptop", "1.0.0", tools)
+    allowed = [f"mcp__laptop__{schema['name']}" for schema in SCHEMAS]
+    return server, allowed
 
 
 class SdkBrain:
-    """Same surface as brain.Brain, backed by the Claude subscription."""
+    """Same surface as the API brain, backed by the Claude subscription."""
 
-    def __init__(self):
+    def __init__(self, executor=None):
+        self.executor = executor or ToolExecutor(brain_label="subscription")
+        self._server, self._allowed = _make_server(self.executor)
         self.clients = {}   # channel id -> connected ClaudeSDKClient (keeps conversation memory)
         self.busy = set()
         self._spare = None  # pre-connected client, so the first message doesn't pay startup cost
+
+    @property
+    def model_label(self):
+        return CONFIG.subscription_model or "default"
+
+    def _options(self):
+        kwargs = dict(
+            system_prompt=SYSTEM_PROMPT,
+            mcp_servers={"laptop": self._server},
+            allowed_tools=self._allowed,
+            permission_mode="bypassPermissions",
+            max_turns=CONFIG.max_iterations,
+            # keep the assistant on our tools, not Claude Code's own file/bash tools
+            setting_sources=[],
+        )
+        if CONFIG.subscription_model:
+            kwargs["model"] = CONFIG.subscription_model
+        return sdk.ClaudeAgentOptions(**kwargs)
 
     async def prewarm(self):
         """Connect a session in advance. First reply drops from ~17s to ~3s."""
         if self._spare is not None or self.clients:
             return
         try:
-            client = sdk.ClaudeSDKClient(options=_options())
+            client = sdk.ClaudeSDKClient(options=self._options())
             await client.connect()
             self._spare = client
             print("[brain] Claude session pre-warmed")
@@ -173,7 +150,7 @@ class SdkBrain:
             if self._spare is not None:      # use the pre-warmed session
                 client, self._spare = self._spare, None
             else:
-                client = sdk.ClaudeSDKClient(options=_options())
+                client = sdk.ClaudeSDKClient(options=self._options())
                 await client.connect()
             self.clients[key] = client
         return client

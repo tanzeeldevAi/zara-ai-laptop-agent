@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn>=0.29
+# Ed25519 license signing/verification — shared with the agent package
+# (agent/licensing.py). The server imports the repo's `agent` package, so
+# run it from the repository root (see README.md).
+cryptography>=42.0
+python-dotenv>=1.0.1
+keyring>=24.0

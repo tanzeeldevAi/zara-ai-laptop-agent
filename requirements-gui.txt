@@ -1,0 +1,6 @@
+# Desktop-shell dependencies (tray app + setup wizard).
+# The headless agent only needs requirements.txt; install this file as well
+# for the GUI:   pip install -r requirements-gui.txt
+-r requirements.txt
+PySide6>=6.6
+qrcode[pil]>=7.4

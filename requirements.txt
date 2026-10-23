@@ -1,5 +1,11 @@
 discord.py>=2.3.2
+python-telegram-bot>=21
+websockets>=12
 anthropic>=0.40.0
+litellm>=1.40.0
+keyring>=24.0
+# Phase 4: Ed25519 license-key signing/verification (agent/licensing.py).
+cryptography>=42.0
 python-dotenv>=1.0.1
 mss>=9.0.1
 Pillow>=10.3.0
@@ -10,3 +16,10 @@ pyperclip>=1.8.2
 edge-tts>=6.1.12
 faster-whisper>=1.0.3
 claude-agent-sdk>=0.1.0
+# Browser tool (Phase 3): the Playwright library. The Chromium binary is a
+# separate one-time setup step — run `playwright install chromium` once
+# after pip install (bundled by the installer in Phase 5).
+playwright>=1.40.0
+
+# Desktop shell (tray + setup wizard, Phase 2): PySide6 and qrcode live in
+# requirements-gui.txt so a headless agent install stays lean.

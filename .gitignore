@@ -2,10 +2,15 @@
 .env
 .env.local
 *.key
+# Phase 4: the seller's license-signing private key must NEVER be in the repo.
+*.pem
+license_private*
+license_server/*.db
 
 # runtime
 .venv/
 .runtime/
+node_modules/
 __pycache__/
 *.pyc
 *.pyo
